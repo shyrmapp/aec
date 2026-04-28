@@ -10,7 +10,7 @@ No cgo. No external C libraries. Cross-compiles to any platform Go supports.
 go get github.com/shyrmapp/aec
 ```
 
-Requires Go 1.24+.
+Requires Go 1.26+.
 
 ## Usage
 
