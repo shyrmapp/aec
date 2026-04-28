@@ -68,8 +68,11 @@ AEC is the underlying algorithm for the szip compression filter in HDF5. The sam
 - NN (nearest-neighbour) preprocessing / postprocessing
 - RSI-aligned padding (`FlagPadRSI`)
 - Unsigned data, 1–32 bits per sample
+- Block sizes 8/16/32/64; RSI up to 4096 (and beyond)
 - In-memory and streaming decode
-- Validated against all official CCSDS 121B2 test vectors (1–32 bit, all coding modes, low entropy, extended parameters)
+- Validated against the full official CCSDS 121B2 reference set (`AllOptions` n01–n32, `LowEntropyOptions` Lowset1/2/3, `ExtendedParameters` j16/r256 and j64/r4096)
+- Bit-exact match against libaec 1.1.6 on a real ECMWF AIFS open-data GRIB2 message (1,038,240 samples, 16 bps, BlockSize=32, RSI=128, FlagMSB|FlagPreprocess|Flag3Byte) — `TestRealWorldECMWFAIFS`
+- Surfaces truncated/corrupted streams as `io.ErrUnexpectedEOF` rather than returning silent garbage
 - Production-tested on DWD ICON-D2/ICON-EU GRIB2 NWP data
 
 ## Limitations
@@ -77,6 +80,7 @@ AEC is the underlying algorithm for the szip compression filter in HDF5. The sam
 - **No encoder** — decode only (contributions welcome)
 - **No signed data** — `FlagSigned` returns an error
 - **No restricted mode** — `FlagRestricted` returns an error
+- **`Flag3Byte` has no effect** — the decoder returns `[]uint32`, so 3-byte output packing is the caller's concern
 
 ## Why this exists
 

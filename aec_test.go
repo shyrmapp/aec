@@ -5,7 +5,11 @@ package aec
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"io"
 	"os"
 	"testing"
 )
@@ -89,6 +93,188 @@ func TestUnsupportedFlags(t *testing.T) {
 	}
 }
 
+// TestParamValidation locks in rejection of out-of-spec parameters.
+// Without these checks RSI=0 caused an infinite loop and BlockSize=0 produced
+// undefined output.
+func TestParamValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		p    Params
+	}{
+		{"RSI zero", Params{NumValues: 16, BitsPerSample: 8, BlockSize: 16, RSI: 0}},
+		{"RSI negative", Params{NumValues: 16, BitsPerSample: 8, BlockSize: 16, RSI: -1}},
+		{"BlockSize zero", Params{NumValues: 16, BitsPerSample: 8, BlockSize: 0, RSI: 16}},
+		{"BlockSize odd", Params{NumValues: 16, BitsPerSample: 8, BlockSize: 15, RSI: 16}},
+		{"BitsPerSample > 32", Params{NumValues: 16, BitsPerSample: 33, BlockSize: 16, RSI: 16}},
+		{"BitsPerSample negative", Params{NumValues: 16, BitsPerSample: -1, BlockSize: 16, RSI: 16}},
+		{"NumValues negative", Params{NumValues: -1, BitsPerSample: 8, BlockSize: 16, RSI: 16}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := Decode(nil, c.p); err == nil {
+				t.Errorf("expected error for %s", c.name)
+			}
+		})
+	}
+}
+
+// TestTruncatedStream verifies that decoding a truncated payload reports
+// io.ErrUnexpectedEOF instead of returning silently-wrong data.
+func TestTruncatedStream(t *testing.T) {
+	full := loadTestFile(t, "testdata/test_p256n08.rz")
+	if len(full) < 4 {
+		t.Skip("test vector too small")
+	}
+	truncated := full[:len(full)/2]
+	p := Params{
+		BitsPerSample: 8, BlockSize: 16, RSI: 16,
+		Flags: FlagPreprocess, NumValues: 256,
+	}
+	_, err := Decode(truncated, p)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("got err=%v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
+// TestStreamingTruncated reaches the streaming underflow path.
+func TestStreamingTruncated(t *testing.T) {
+	full := loadTestFile(t, "testdata/test_p256n08.rz")
+	if len(full) < 4 {
+		t.Skip("test vector too small")
+	}
+	dec := NewDecoder(bytes.NewReader(full[:len(full)/2]), Params{
+		BitsPerSample: 8, BlockSize: 16, RSI: 16,
+		Flags: FlagPreprocess, NumValues: 256,
+	})
+	_, err := dec.DecodeAll()
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("got err=%v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
+// slowReader returns 1 byte per Read to exercise piecemeal io.Reader handling.
+type slowReader struct{ data []byte }
+
+func (s *slowReader) Read(p []byte) (int, error) {
+	if len(s.data) == 0 {
+		return 0, io.EOF
+	}
+	if len(p) > 0 {
+		p[0] = s.data[0]
+		s.data = s.data[1:]
+		return 1, nil
+	}
+	return 0, nil
+}
+
+// TestStreamingSlowReader verifies the streaming path is correct when the
+// reader hands out one byte at a time.
+func TestStreamingSlowReader(t *testing.T) {
+	compressed := loadTestFile(t, "testdata/test_p256n08.rz")
+	p := Params{
+		BitsPerSample: 8, BlockSize: 16, RSI: 16,
+		Flags: FlagPreprocess, NumValues: 256,
+	}
+	want, err := Decode(compressed, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := NewDecoder(&slowReader{data: append([]byte(nil), compressed...)}, p).DecodeAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len mismatch got=%d want=%d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("mismatch at %d: got=%d want=%d", i, got[i], want[i])
+		}
+	}
+}
+
+// bitWriter packs bits MSB-first to match the AEC bitstream layout.
+type bitWriter struct {
+	buf  []byte
+	cur  byte
+	used int
+}
+
+func (w *bitWriter) write(value uint64, n int) {
+	for i := n - 1; i >= 0; i-- {
+		bit := byte((value >> i) & 1)
+		w.cur = (w.cur << 1) | bit
+		w.used++
+		if w.used == 8 {
+			w.buf = append(w.buf, w.cur)
+			w.cur, w.used = 0, 0
+		}
+	}
+}
+
+func (w *bitWriter) bytes() []byte {
+	if w.used == 0 {
+		return w.buf
+	}
+	return append(w.buf, w.cur<<(8-w.used))
+}
+
+// TestZeroBlockROSBoundary exposes the prior fill-to-boundary bug. The stream
+// contains two RSIs (each 2 blocks of 8 samples). RSI 1 starts with a
+// zero-block low-entropy block carrying FS=4, which encodes ROS=5 (the
+// fill-to-boundary escape).
+//
+// Correct behaviour (fixed code): clamp zero-fill to MIN(64-blocksDecoded%64,
+// RSI-blocksDecoded) = MIN(64, 2) = 2 blocks. RSI 1 ends. Decoder then reads
+// RSI 2's two no-compression blocks and emits the literal samples.
+//
+// Buggy behaviour (old code): clamp to 64-segPos = 64. Inner loop fills 16
+// zeros (capped by NumValues). RSI 2 is never decoded — output ends up all
+// zeros, mismatching the literal RSI 2 values.
+func TestZeroBlockROSBoundary(t *testing.T) {
+	w := &bitWriter{}
+	// RSI 1, block 0: low-entropy zero-block.
+	w.write(0b000, 3)   // id=0
+	w.write(0, 1)       // sub-bit = 0 (zero-block)
+	w.write(0x00, 8)    // reference sample = 0
+	w.write(0b00001, 5) // FS = 4 → zeroBlocks = 5 → ROS escape
+	// RSI 2, block 0: no compression. id=7, ref=0xAA, then 7 × 0xBB.
+	w.write(0b111, 3)
+	w.write(0xAA, 8)
+	for i := 0; i < 7; i++ {
+		w.write(0xBB, 8)
+	}
+	// RSI 2, block 1: no compression. id=7, 8 × 0xCC.
+	w.write(0b111, 3)
+	for i := 0; i < 8; i++ {
+		w.write(0xCC, 8)
+	}
+
+	out, err := Decode(w.bytes(), Params{
+		BitsPerSample: 8, BlockSize: 8, RSI: 2,
+		NumValues: 32, // 2 RSIs × 2 blocks × 8 samples
+	})
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := make([]uint32, 32)
+	// RSI 1: 16 zeros (already zero-init).
+	// RSI 2 block 0: 0xAA, 0xBB×7
+	want[16] = 0xAA
+	for i := 17; i < 24; i++ {
+		want[i] = 0xBB
+	}
+	// RSI 2 block 1: 0xCC×8
+	for i := 24; i < 32; i++ {
+		want[i] = 0xCC
+	}
+	for i := range out {
+		if out[i] != want[i] {
+			t.Errorf("out[%d]=%#x, want %#x", i, out[i], want[i])
+		}
+	}
+}
+
 // --- Streaming API tests ---
 
 func TestStreamingDecoder(t *testing.T) {
@@ -138,6 +324,7 @@ type testVector struct {
 }
 
 var allOptionsVectors = []testVector{
+	// 1–8 bit: BlockSize=16, RSI=16
 	{"p256n01-basic", "testdata/test_p256n01-basic.rz", "testdata/test_p256n01.dat", 1, 16, 16, FlagPreprocess},
 	{"p256n02-basic", "testdata/test_p256n02-basic.rz", "testdata/test_p256n02.dat", 2, 16, 16, FlagPreprocess},
 	{"p256n03-basic", "testdata/test_p256n03-basic.rz", "testdata/test_p256n03.dat", 3, 16, 16, FlagPreprocess},
@@ -146,17 +333,45 @@ var allOptionsVectors = []testVector{
 	{"p256n06", "testdata/test_p256n06.rz", "testdata/test_p256n06.dat", 6, 16, 16, FlagPreprocess},
 	{"p256n07", "testdata/test_p256n07.rz", "testdata/test_p256n07.dat", 7, 16, 16, FlagPreprocess},
 	{"p256n08", "testdata/test_p256n08.rz", "testdata/test_p256n08.dat", 8, 16, 16, FlagPreprocess},
+	// 9–16 bit: BlockSize=16, RSI=16 (idLen=4)
+	{"p256n09", "testdata/test_p256n09.rz", "testdata/test_p256n09.dat", 9, 16, 16, FlagPreprocess},
+	{"p256n10", "testdata/test_p256n10.rz", "testdata/test_p256n10.dat", 10, 16, 16, FlagPreprocess},
+	{"p256n11", "testdata/test_p256n11.rz", "testdata/test_p256n11.dat", 11, 16, 16, FlagPreprocess},
+	{"p256n12", "testdata/test_p256n12.rz", "testdata/test_p256n12.dat", 12, 16, 16, FlagPreprocess},
+	{"p256n13", "testdata/test_p256n13.rz", "testdata/test_p256n13.dat", 13, 16, 16, FlagPreprocess},
+	{"p256n14", "testdata/test_p256n14.rz", "testdata/test_p256n14.dat", 14, 16, 16, FlagPreprocess},
+	{"p256n15", "testdata/test_p256n15.rz", "testdata/test_p256n15.dat", 15, 16, 16, FlagPreprocess},
+	{"p256n16", "testdata/test_p256n16.rz", "testdata/test_p256n16.dat", 16, 16, 16, FlagPreprocess},
+	// 17–32 bit: BlockSize=16, RSI=32 (idLen=5)
+	{"p512n17", "testdata/test_p512n17.rz", "testdata/test_p512n17.dat", 17, 16, 32, FlagPreprocess},
+	{"p512n20", "testdata/test_p512n20.rz", "testdata/test_p512n20.dat", 20, 16, 32, FlagPreprocess},
+	{"p512n24", "testdata/test_p512n24.rz", "testdata/test_p512n24.dat", 24, 16, 32, FlagPreprocess},
+	{"p512n28", "testdata/test_p512n28.rz", "testdata/test_p512n28.dat", 28, 16, 32, FlagPreprocess},
+	{"p512n32", "testdata/test_p512n32.rz", "testdata/test_p512n32.dat", 32, 16, 32, FlagPreprocess},
 }
 
 var lowEntropyVectors = []testVector{
+	// Lowset1: BlockSize=16, RSI=64
 	{"lowset1-n01-basic", "testdata/Lowset1_8bit.n01-basic.rz", "testdata/Lowset1_8bit.dat", 1, 16, 64, FlagPreprocess},
 	{"lowset1-n02-basic", "testdata/Lowset1_8bit.n02-basic.rz", "testdata/Lowset1_8bit.dat", 2, 16, 64, FlagPreprocess},
 	{"lowset1-n03-basic", "testdata/Lowset1_8bit.n03-basic.rz", "testdata/Lowset1_8bit.dat", 3, 16, 64, FlagPreprocess},
 	{"lowset1-n04-basic", "testdata/Lowset1_8bit.n04-basic.rz", "testdata/Lowset1_8bit.dat", 4, 16, 64, FlagPreprocess},
+	// Lowset2: distinct distribution, exercises zero-block runs
+	{"lowset2-n01-basic", "testdata/Lowset2_8bit.n01-basic.rz", "testdata/Lowset2_8bit.dat", 1, 16, 64, FlagPreprocess},
+	{"lowset2-n02-basic", "testdata/Lowset2_8bit.n02-basic.rz", "testdata/Lowset2_8bit.dat", 2, 16, 64, FlagPreprocess},
+	{"lowset2-n05", "testdata/Lowset2_8bit.n05.rz", "testdata/Lowset2_8bit.dat", 5, 16, 64, FlagPreprocess},
+	{"lowset2-n08", "testdata/Lowset2_8bit.n08.rz", "testdata/Lowset2_8bit.dat", 8, 16, 64, FlagPreprocess},
+	// Lowset3: long zero-block runs, hits ROS=5 fill-to-boundary path
+	{"lowset3-n01-basic", "testdata/Lowset3_8bit.n01-basic.rz", "testdata/Lowset3_8bit.dat", 1, 16, 64, FlagPreprocess},
+	{"lowset3-n04-basic", "testdata/Lowset3_8bit.n04-basic.rz", "testdata/Lowset3_8bit.dat", 4, 16, 64, FlagPreprocess},
+	{"lowset3-n08", "testdata/Lowset3_8bit.n08.rz", "testdata/Lowset3_8bit.dat", 8, 16, 64, FlagPreprocess},
 }
 
 var extendedVectors = []testVector{
+	// BlockSize=16, RSI=256 — typical SAR
 	{"sar32bit-j16-r256", "testdata/sar32bit.j16.r256.rz", "testdata/sar32bit.dat", 32, 16, 256, FlagPreprocess | FlagPadRSI},
+	// BlockSize=64, RSI=4096 — large block + large RSI stress test
+	{"sar32bit-j64-r4096", "testdata/sar32bit.j64.r4096.rz", "testdata/sar32bit.dat", 32, 64, 4096, FlagPreprocess | FlagPadRSI},
 }
 
 // CCSDS 121B2 test vectors from the official specification.
@@ -228,6 +443,49 @@ func testDecode(t *testing.T, tv testVector) {
 	}
 }
 
+// --- Real-world regression ---
+
+// TestRealWorldECMWFAIFS decodes a Section-7 AEC payload extracted from a
+// real ECMWF AIFS open-data GRIB2 message (template 5.42). The expected
+// SHA256 was produced by libaec 1.1.6's aec_buffer_decode on the same
+// payload, with output reinterpreted from big-endian uint16 (libaec's
+// FlagMSB layout) to little-endian uint32 for hashing.
+//
+// Parameters extracted from GRIB2 Section 5:
+//
+//	NumValues=1038240, BitsPerSample=16, BlockSize=32, RSI=128,
+//	Flags=0x0e (Flag3Byte | FlagMSB | FlagPreprocess)
+//
+// This is the only test in the suite that exercises BlockSize=32 and
+// Flag3Byte being set on 16-bit data (libaec ignores Flag3Byte unless
+// BitsPerSample is 17–24; we must do the same).
+func TestRealWorldECMWFAIFS(t *testing.T) {
+	const expectedHash = "ac77074c245e5e76573693c5c3482b74af7227140438723c2c2a672dfd521fef"
+	compressed := loadTestFile(t, "testdata/ecmwf_aifs_t.aec")
+	out, err := Decode(compressed, Params{
+		BitsPerSample: 16,
+		BlockSize:     32,
+		RSI:           128,
+		Flags:         Flag3Byte | FlagMSB | FlagPreprocess,
+		NumValues:     1038240,
+	})
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out) != 1038240 {
+		t.Fatalf("len=%d, want 1038240", len(out))
+	}
+	buf := make([]byte, 4*len(out))
+	for i, v := range out {
+		binary.LittleEndian.PutUint32(buf[i*4:], v)
+	}
+	sum := sha256.Sum256(buf)
+	got := hex.EncodeToString(sum[:])
+	if got != expectedHash {
+		t.Fatalf("output hash mismatch:\n  got  %s\n  want %s", got, expectedHash)
+	}
+}
+
 // --- Benchmarks ---
 
 func BenchmarkDecode_8bit(b *testing.B) {
@@ -283,33 +541,43 @@ func loadBenchFile(b *testing.B, path string) []byte {
 }
 
 // numValues calculates the number of samples from a .dat file path and bit depth.
-// CCSDS test data packs samples into the smallest byte-aligned container:
-// 1–8 bits → 1 byte/sample, 9–16 → 2 bytes, 17–24 → 3 bytes, 25–32 → 4 bytes.
+// libaec's graec, in default (non-3-byte) mode, packs 17–24-bit samples into
+// 4 bytes per sample, not 3. This matches what the CCSDS .dat reference files
+// contain.
 func numValues(datPath string, bitsPerSample int) int {
 	info, err := os.Stat(datPath)
 	if err != nil {
 		return 0
 	}
-	bytesPerSample := (bitsPerSample + 7) / 8
+	bytesPerSample := bytesPerSample(bitsPerSample)
 	return int(info.Size()) / bytesPerSample
+}
+
+func bytesPerSample(bitsPerSample int) int {
+	switch {
+	case bitsPerSample <= 8:
+		return 1
+	case bitsPerSample <= 16:
+		return 2
+	default:
+		return 4 // 17–32 bits, libaec default packing
+	}
 }
 
 // referenceToUint32 interprets raw little-endian packed bytes as uint32 samples.
 // The CCSDS test vectors are produced by libaec's graec tool which defaults to
 // LSB (little-endian) byte order for multi-byte samples.
 func referenceToUint32(data []byte, bitsPerSample int) []uint32 {
-	bytesPerSample := (bitsPerSample + 7) / 8
-	n := len(data) / bytesPerSample
+	bps := bytesPerSample(bitsPerSample)
+	n := len(data) / bps
 	out := make([]uint32, n)
 	for i := 0; i < n; i++ {
-		off := i * bytesPerSample
-		switch bytesPerSample {
+		off := i * bps
+		switch bps {
 		case 1:
 			out[i] = uint32(data[off])
 		case 2:
 			out[i] = uint32(binary.LittleEndian.Uint16(data[off:]))
-		case 3:
-			out[i] = uint32(data[off]) | uint32(data[off+1])<<8 | uint32(data[off+2])<<16
 		case 4:
 			out[i] = binary.LittleEndian.Uint32(data[off:])
 		}

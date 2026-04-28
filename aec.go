@@ -44,7 +44,9 @@
 // # Unsupported features
 //
 // Signed data ([FlagSigned]) and restricted coding ([FlagRestricted])
-// are not implemented and return an error.
+// are not implemented and return an error. [Flag3Byte] is accepted but has
+// no effect: the decoder's output is always []uint32, so 3-byte output
+// packing is the caller's concern.
 //
 // # References
 //
@@ -61,18 +63,18 @@ import (
 // Coding option flags, matching the libaec/CCSDS 121.0-B constants.
 const (
 	FlagSigned     = 1  // AEC_DATA_SIGNED (not supported)
-	Flag3Byte      = 2  // AEC_DATA_3BYTE — 3-byte samples packed into 24 bits
+	Flag3Byte      = 2  // AEC_DATA_3BYTE (no effect: output is []uint32)
 	FlagMSB        = 4  // AEC_DATA_MSB — most-significant bit first
 	FlagPreprocess = 8  // AEC_DATA_PREPROCESS — NN preprocessing enabled
 	FlagRestricted = 16 // AEC_RESTRICTED (not supported)
-	FlagPadRSI     = 32 // AEC_PAD_RSI (not supported)
+	FlagPadRSI     = 32 // AEC_PAD_RSI — RSI byte-boundary padding
 )
 
 // Params configures the AEC decoder.
 type Params struct {
 	BitsPerSample int // Sample depth in bits (1–32).
-	BlockSize     int // Number of samples per block (typically 8, 16, 32, or 64).
-	RSI           int // Reference Sample Interval in blocks.
+	BlockSize     int // Number of samples per block (8, 16, 32, or 64).
+	RSI           int // Reference Sample Interval in blocks (>0).
 	Flags         int // Bitwise OR of Flag* constants.
 	NumValues     int // Total number of samples to decode.
 }
@@ -107,8 +109,14 @@ func newDecoderFromBits(br *bitReader, p Params) *Decoder {
 func (d *Decoder) DecodeAll() ([]uint32, error) {
 	p := d.params
 
+	if p.NumValues < 0 {
+		return nil, fmt.Errorf("aec: NumValues must be >= 0")
+	}
 	if p.NumValues == 0 {
 		return nil, nil
+	}
+	if p.BitsPerSample < 0 || p.BitsPerSample > 32 {
+		return nil, fmt.Errorf("aec: BitsPerSample must be 0..32, got %d", p.BitsPerSample)
 	}
 	if p.BitsPerSample == 0 {
 		return make([]uint32, p.NumValues), nil
@@ -118,6 +126,12 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 	}
 	if p.Flags&FlagRestricted != 0 {
 		return nil, fmt.Errorf("aec: restricted mode not supported")
+	}
+	if p.RSI <= 0 {
+		return nil, fmt.Errorf("aec: RSI must be > 0, got %d", p.RSI)
+	}
+	if p.BlockSize <= 0 || p.BlockSize&1 != 0 {
+		return nil, fmt.Errorf("aec: BlockSize must be even and > 0, got %d", p.BlockSize)
 	}
 
 	preprocess := p.Flags&FlagPreprocess != 0
@@ -132,10 +146,12 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 		idLen = 3
 	}
 
-	seTable := buildSETable()
 	br := d.br
 	out := make([]uint32, 0, p.NumValues)
-	xmax := uint32((1 << p.BitsPerSample) - 1)
+	xmax := uint32(0xFFFFFFFF)
+	if p.BitsPerSample < 32 {
+		xmax = uint32((1 << p.BitsPerSample) - 1)
+	}
 
 	firstRSI := true
 	for len(out) < p.NumValues {
@@ -156,10 +172,11 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 			case id == 0:
 				// Low-entropy: sub-bit is read BEFORE reference (libaec order:
 				// m_id -> m_low_entropy reads sub-bit -> m_low_entropy_ref reads ref).
+				// Note: codedInBlock is unused in this branch — zero-block and SE
+				// each track their own sample count via blocksDecoded / `i`.
 				subBit := br.readBits(1)
 				if refPending {
 					out = append(out, uint32(br.readBits(p.BitsPerSample)))
-					codedInBlock = p.BlockSize - 1
 					refPending = false
 				}
 				if subBit == 0 {
@@ -168,9 +185,16 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 					fs := br.readFS()
 					zeroBlocks := fs + 1
 					if zeroBlocks == ros {
+						// Fill-to-boundary: clamp by both segment (64-block)
+						// and RSI boundaries (libaec m_zero_block).
 						segPos := blocksDecoded % 64
-						zeroBlocks = 64 - segPos
-						if zeroBlocks == 0 {
+						toSeg := 64 - segPos
+						toRSI := p.RSI - blocksDecoded
+						zeroBlocks = toSeg
+						if toRSI < zeroBlocks {
+							zeroBlocks = toRSI
+						}
+						if zeroBlocks <= 0 {
 							zeroBlocks = 64
 						}
 					} else if zeroBlocks > ros {
@@ -181,8 +205,12 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 						refSamples = 1
 					}
 					zeroSamples := zeroBlocks*p.BlockSize - refSamples
-					for i := 0; i < zeroSamples && len(out) < p.NumValues; i++ {
-						out = append(out, 0)
+					remaining := p.NumValues - len(out)
+					if zeroSamples > remaining {
+						zeroSamples = remaining
+					}
+					if zeroSamples > 0 {
+						out = append(out, make([]uint32, zeroSamples)...)
 					}
 					blocksDecoded += zeroBlocks
 					continue
@@ -254,6 +282,9 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 	if len(out) > p.NumValues {
 		out = out[:p.NumValues]
 	}
+	if err := br.err(); err != nil {
+		return out, err
+	}
 	return out, nil
 }
 
@@ -292,7 +323,8 @@ func inversePreprocess(samples []uint32, xmax uint32) {
 // so gamma values stay small regardless of bitsPerSample.
 const seTableSize = 91
 
-func buildSETable() [][2]uint32 {
+// seTable is the precomputed second-extension lookup table.
+var seTable = func() [][2]uint32 {
 	table := make([][2]uint32, seTableSize)
 	gamma := 0
 	for beta := 0; gamma < seTableSize; beta++ {
@@ -302,4 +334,12 @@ func buildSETable() [][2]uint32 {
 		}
 	}
 	return table
+}()
+
+// buildSETable returns a fresh copy of the SE lookup table. Retained for
+// tests that want to verify table generation independently.
+func buildSETable() [][2]uint32 {
+	out := make([][2]uint32, seTableSize)
+	copy(out, seTable)
+	return out
 }
