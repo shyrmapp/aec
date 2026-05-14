@@ -81,13 +81,6 @@ func (br *bitReader) fillUpTo(n int) {
 	}
 }
 
-func (br *bitReader) fillStream(n int) {
-	br.fillStreamUpTo(n)
-	if br.bits < n {
-		br.underflow = true
-	}
-}
-
 func (br *bitReader) fillStreamUpTo(n int) {
 	for br.bits < n {
 		if br.rstart >= br.rend {
