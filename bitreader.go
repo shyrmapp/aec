@@ -9,6 +9,11 @@ import (
 	"math/bits"
 )
 
+// streamBufSize is the streaming refill buffer. Sized to match typical OS
+// readahead so each Read() amortizes well; allocated lazily only when the
+// streaming constructor is used so the in-memory path stays cheap.
+const streamBufSize = 64 * 1024
+
 // bitReader is a bit-level reader that works with both in-memory byte slices
 // and streaming io.Reader sources. The accumulator holds the next "bits"
 // unread bits in its low-order positions; the most significant unread bit
@@ -20,7 +25,7 @@ type bitReader struct {
 
 	// Streaming source (nil when in-memory).
 	r      io.Reader
-	rbuf   [4096]byte
+	rbuf   []byte // sized to streamBufSize when streaming
 	rstart int
 	rend   int
 
@@ -33,15 +38,33 @@ type bitReader struct {
 }
 
 func newStreamBitReader(r io.Reader) *bitReader {
-	return &bitReader{r: r}
+	return &bitReader{r: r, rbuf: make([]byte, streamBufSize)}
 }
 
 // fill ensures the accumulator holds at least n bits, where 1 <= n <= 56.
 // Sets underflow when the source is exhausted before n bits are available.
 func (br *bitReader) fill(n int) {
+	br.fillUpTo(n)
+	if br.bits < n {
+		br.underflow = true
+	}
+}
+
+// fillUpTo loads up to n bits without latching underflow when the source is
+// short. Used by readFS to pre-fill a 56-bit window even when fewer bits
+// remain — the FS scan handles trailing-bit underflow via its empty-window
+// branch, so latching here would surface a false error.
+func (br *bitReader) fillUpTo(n int) {
 	if br.r != nil {
-		br.fillStream(n)
+		br.fillStreamUpTo(n)
 		return
+	}
+	// 8-byte fast path: when the accumulator is empty there is room for a
+	// full 64-bit load. Cheaper than two 32-bit folds.
+	if br.bits == 0 && br.pos+8 <= len(br.data) {
+		br.acc = binary.BigEndian.Uint64(br.data[br.pos:])
+		br.pos += 8
+		br.bits = 64
 	}
 	// Bulk-fold 4 bytes at a time when there is room (bits <= 32 means at
 	// least 32 free high-order bits in the 64-bit accumulator).
@@ -56,24 +79,35 @@ func (br *bitReader) fill(n int) {
 		br.pos++
 		br.bits += 8
 	}
+}
+
+func (br *bitReader) fillStream(n int) {
+	br.fillStreamUpTo(n)
 	if br.bits < n {
 		br.underflow = true
 	}
 }
 
-func (br *bitReader) fillStream(n int) {
+func (br *bitReader) fillStreamUpTo(n int) {
 	for br.bits < n {
 		if br.rstart >= br.rend {
-			nr, err := br.r.Read(br.rbuf[:])
+			nr, err := br.r.Read(br.rbuf)
 			br.rstart = 0
 			br.rend = nr
 			if nr == 0 {
 				if err != nil {
-					br.underflow = true
+					// Source exhausted; callers wrapping via fill(n)
+					// observe bits < n and latch underflow themselves.
 					return
 				}
 				continue
 			}
+		}
+		// Mirror the in-memory 8-byte fast path.
+		if br.bits == 0 && br.rend-br.rstart >= 8 {
+			br.acc = binary.BigEndian.Uint64(br.rbuf[br.rstart:])
+			br.rstart += 8
+			br.bits = 64
 		}
 		for br.bits <= 32 && br.rend-br.rstart >= 4 {
 			v := uint64(binary.BigEndian.Uint32(br.rbuf[br.rstart:]))
@@ -90,7 +124,12 @@ func (br *bitReader) fillStream(n int) {
 }
 
 // readBits reads n bits (1 <= n <= 56). Returns 0 on underflow.
+// n > 56 is a programmer error — the (1<<n)-1 mask breaks past 63 — so
+// the function returns 0 without consuming bits.
 func (br *bitReader) readBits(n int) uint64 {
+	if n <= 0 || n > 56 {
+		return 0
+	}
 	if br.bits < n {
 		br.fill(n)
 		if br.bits < n {
@@ -102,13 +141,13 @@ func (br *bitReader) readBits(n int) uint64 {
 }
 
 // readFS reads a fundamental-sequence value: number of leading zero bits,
-// consuming the terminating 1 bit. Uses LeadingZeros64 to scan up to 56 bits
-// per fill instead of bit-at-a-time.
+// consuming the terminating 1 bit. Pre-fills 56 bits so common FS values
+// (0-10) finish in a single LeadingZeros64 scan.
 func (br *bitReader) readFS() int {
 	count := 0
 	for {
 		if br.bits == 0 {
-			br.fill(1)
+			br.fillUpTo(56)
 			if br.bits == 0 {
 				return count
 			}

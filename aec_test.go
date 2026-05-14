@@ -486,6 +486,73 @@ func TestRealWorldECMWFAIFS(t *testing.T) {
 	}
 }
 
+// TestDecodeInto verifies that the caller-supplied-buffer entry point yields
+// identical output to Decode and reuses the backing array when capacity
+// permits, eliminating an allocation on hot paths.
+func TestDecodeInto(t *testing.T) {
+	compressed := loadTestFile(t, "testdata/test_p256n08.rz")
+	p := Params{
+		BitsPerSample: 8, BlockSize: 16, RSI: 16,
+		Flags: FlagPreprocess, NumValues: 256,
+	}
+	want, err := Decode(compressed, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]uint32, 0, 256)
+	got, err := DecodeInto(buf, compressed, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len=%d, want=%d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("mismatch at %d: got=%d want=%d", i, got[i], want[i])
+		}
+	}
+	// Reuse: pre-dirty the buffer; a second decode must scrub stale entries
+	// during zero-block handling and produce the same output.
+	dirty := got[:cap(got)]
+	for i := range dirty {
+		dirty[i] = 0xDEADBEEF
+	}
+	got2, err := DecodeInto(dirty[:0], compressed, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range got2 {
+		if got2[i] != want[i] {
+			t.Fatalf("reuse mismatch at %d: got=%d want=%d", i, got2[i], want[i])
+		}
+	}
+}
+
+// TestReadBitsBoundsCheck locks in the n > 56 guard. Without it the
+// (1<<n)-1 mask wraps and the decoder can silently return wrong values.
+func TestReadBitsBoundsCheck(t *testing.T) {
+	br := &bitReader{data: []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}
+	if v := br.readBits(64); v != 0 {
+		t.Errorf("readBits(64) = %d, want 0 (rejected)", v)
+	}
+	if v := br.readBits(0); v != 0 {
+		t.Errorf("readBits(0) = %d, want 0 (rejected)", v)
+	}
+}
+
+// TestInversePreprocessShortSlice exercises the short-slice guard added so
+// callers cannot trip an out-of-bounds read on a degenerate RSI.
+func TestInversePreprocessShortSlice(t *testing.T) {
+	inversePreprocess(nil, 255)        // must not panic
+	inversePreprocess([]uint32{}, 255) // must not panic
+	one := []uint32{42}
+	inversePreprocess(one, 255)
+	if one[0] != 42 {
+		t.Errorf("len=1 slice modified: got %d, want 42", one[0])
+	}
+}
+
 // --- Benchmarks ---
 
 func BenchmarkDecode_8bit(b *testing.B) {
@@ -514,6 +581,45 @@ func BenchmarkDecode_32bit_Preprocess(b *testing.B) {
 		NumValues:     262144, // 1MB / 4 bytes
 	}
 	b.SetBytes(262144 * 4)
+	b.ResetTimer()
+	for b.Loop() {
+		Decode(compressed, p)
+	}
+}
+
+// BenchmarkDecodeInto_32bit measures the hot-path win of reusing a
+// caller-supplied output buffer across many decodes (matches GRIB2 ingest
+// patterns where each message decodes into the same destination).
+func BenchmarkDecodeInto_32bit(b *testing.B) {
+	compressed := loadBenchFile(b, "testdata/sar32bit.j16.r256.rz")
+	p := Params{
+		BitsPerSample: 32,
+		BlockSize:     16,
+		RSI:           256,
+		Flags:         FlagPreprocess | FlagPadRSI,
+		NumValues:     262144,
+	}
+	buf := make([]uint32, p.NumValues)
+	b.SetBytes(262144 * 4)
+	b.ResetTimer()
+	for b.Loop() {
+		DecodeInto(buf, compressed, p)
+	}
+}
+
+// BenchmarkDecode_FSHeavy stresses readFS using the Lowset3 vector — its
+// dominant codepath is long fundamental-sequence runs, exactly the case the
+// fillUpTo(56) prefill is designed for.
+func BenchmarkDecode_FSHeavy(b *testing.B) {
+	compressed := loadBenchFile(b, "testdata/Lowset3_8bit.n08.rz")
+	p := Params{
+		BitsPerSample: 8,
+		BlockSize:     16,
+		RSI:           64,
+		Flags:         FlagPreprocess,
+		NumValues:     2048,
+	}
+	b.SetBytes(int64(p.NumValues))
 	b.ResetTimer()
 	for b.Loop() {
 		Decode(compressed, p)

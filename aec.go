@@ -86,10 +86,21 @@ func Decode(compressed []byte, p Params) ([]uint32, error) {
 	return newDecoderFromBits(&bitReader{data: compressed}, p).DecodeAll()
 }
 
+// DecodeInto decompresses into a caller-supplied buffer. The buffer is
+// resliced to exactly p.NumValues; its capacity must be at least p.NumValues
+// or a fresh slice is allocated. Use this on hot paths (GRIB2 ingest) to
+// reuse a single backing array across many decodes and avoid GC pressure.
+func DecodeInto(buf []uint32, compressed []byte, p Params) ([]uint32, error) {
+	d := newDecoderFromBits(&bitReader{data: compressed}, p)
+	d.outBuf = buf
+	return d.DecodeAll()
+}
+
 // Decoder reads AEC-compressed data from an [io.Reader].
 type Decoder struct {
 	br     *bitReader
 	params Params
+	outBuf []uint32 // optional caller-supplied destination; see DecodeInto
 }
 
 // NewDecoder creates a streaming AEC decoder that reads compressed data
@@ -147,7 +158,12 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 	}
 
 	br := d.br
-	out := make([]uint32, 0, p.NumValues)
+	var out []uint32
+	if cap(d.outBuf) >= p.NumValues {
+		out = d.outBuf[:0]
+	} else {
+		out = make([]uint32, 0, p.NumValues)
+	}
 	xmax := uint32(0xFFFFFFFF)
 	if p.BitsPerSample < 32 {
 		xmax = uint32((1 << p.BitsPerSample) - 1)
@@ -210,7 +226,17 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 						zeroSamples = remaining
 					}
 					if zeroSamples > 0 {
-						out = append(out, make([]uint32, zeroSamples)...)
+						// Extend in place when cap permits; clear() zeros
+						// the new region so a reused (DecodeInto) buffer
+						// doesn't leak prior contents as fake zeros.
+						start := len(out)
+						end := start + zeroSamples
+						if end <= cap(out) {
+							out = out[:end]
+							clear(out[start:end])
+						} else {
+							out = append(out, make([]uint32, zeroSamples)...)
+						}
 					}
 					blocksDecoded += zeroBlocks
 					continue
@@ -290,6 +316,9 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 
 // inversePreprocess reverses NN preprocessing: inverse mapper then inverse predictor.
 func inversePreprocess(samples []uint32, xmax uint32) {
+	if len(samples) < 2 {
+		return
+	}
 	prev := samples[0]
 	for i := 1; i < len(samples); i++ {
 		d := samples[i]
