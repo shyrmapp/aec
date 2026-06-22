@@ -52,12 +52,11 @@ func TestDecodeZeroBits(t *testing.T) {
 	}
 }
 
-func TestBuildSETable(t *testing.T) {
-	table := buildSETable()
+func TestSETable(t *testing.T) {
 	want := [][2]uint32{{0, 0}, {1, 0}, {0, 1}, {2, 0}}
 	for i, w := range want {
-		if table[i] != w {
-			t.Errorf("table[%d] = %v, want %v", i, table[i], w)
+		if seTable[i] != w {
+			t.Errorf("seTable[%d] = %v, want %v", i, seTable[i], w)
 		}
 	}
 }

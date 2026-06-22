@@ -83,7 +83,7 @@ type Params struct {
 // This is a convenience wrapper around [NewDecoder] for callers that already
 // have the full compressed payload in memory.
 func Decode(compressed []byte, p Params) ([]uint32, error) {
-	return newDecoderFromBits(&bitReader{data: compressed}, p).DecodeAll()
+	return (&Decoder{br: &bitReader{data: compressed}, params: p}).DecodeAll()
 }
 
 // DecodeInto decompresses into a caller-supplied buffer. The buffer is
@@ -91,9 +91,7 @@ func Decode(compressed []byte, p Params) ([]uint32, error) {
 // or a fresh slice is allocated. Use this on hot paths (GRIB2 ingest) to
 // reuse a single backing array across many decodes and avoid GC pressure.
 func DecodeInto(buf []uint32, compressed []byte, p Params) ([]uint32, error) {
-	d := newDecoderFromBits(&bitReader{data: compressed}, p)
-	d.outBuf = buf
-	return d.DecodeAll()
+	return (&Decoder{br: &bitReader{data: compressed}, params: p, outBuf: buf}).DecodeAll()
 }
 
 // Decoder reads AEC-compressed data from an [io.Reader].
@@ -110,10 +108,6 @@ func NewDecoder(r io.Reader, p Params) *Decoder {
 		br:     newStreamBitReader(r),
 		params: p,
 	}
-}
-
-func newDecoderFromBits(br *bitReader, p Params) *Decoder {
-	return &Decoder{br: br, params: p}
 }
 
 // DecodeAll decompresses all values and returns them as a uint32 slice.
@@ -364,11 +358,3 @@ var seTable = func() [][2]uint32 {
 	}
 	return table
 }()
-
-// buildSETable returns a fresh copy of the SE lookup table. Retained for
-// tests that want to verify table generation independently.
-func buildSETable() [][2]uint32 {
-	out := make([][2]uint32, seTableSize)
-	copy(out, seTable)
-	return out
-}
