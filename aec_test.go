@@ -969,7 +969,7 @@ func TestDifferentialGraec(t *testing.T) {
 
 func FuzzDecode(f *testing.F) {
 	for _, name := range []string{
-		"testdata/AllOptions_8bit.n08.rz",
+		"testdata/test_p256n08.rz",
 		"testdata/Lowset1_8bit.n01-basic.rz",
 	} {
 		if b, err := os.ReadFile(name); err == nil {
