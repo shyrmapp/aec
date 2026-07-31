@@ -52,3 +52,5 @@ First block of each RSI carries a reference sample **only when `FlagPreprocess`*
 
 Spec: https://public.ccsds.org/Pubs/121x0b3.pdf
 libaec: https://github.com/MathisRosenhauer/libaec — when in doubt, cross-check `decode.c` (`m_id`, `m_split`, `m_low_entropy`, `m_se`, `m_zero_block`, `m_uncomp`).
+
+The spec is the ultimate authority, but libaec can have bugs — and since nearly all real streams are libaec-encoded, a libaec quirk is de-facto standard. On spec/libaec conflict: follow libaec, document the divergence here; prefer the spec only when libaec's own decoder also rejects its encoder's output.
