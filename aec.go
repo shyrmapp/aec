@@ -41,6 +41,10 @@
 //	})
 //	decoded, err := dec.DecodeAll()
 //
+// On hot paths, [DecodeInto] reuses a caller-supplied buffer across decodes.
+// Truncated or corrupted streams are reported as [io.ErrUnexpectedEOF] or a
+// descriptive error — never as silently wrong data.
+//
 // # Unsupported features
 //
 // Signed data ([FlagSigned]) and restricted coding ([FlagRestricted])
@@ -172,7 +176,9 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 		}
 		firstRSI = false
 		rsiStart := len(out)
-		refPending := true
+		// Reference samples exist only with preprocessing (libaec: state->ref
+		// is gated on state->pp).
+		refPending := preprocess
 
 		for blocksDecoded := 0; blocksDecoded < p.RSI && len(out) < p.NumValues; {
 			id := br.readBits(idLen)
@@ -204,14 +210,15 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 						if toRSI < zeroBlocks {
 							zeroBlocks = toRSI
 						}
-						if zeroBlocks <= 0 {
-							zeroBlocks = 64
-						}
 					} else if zeroBlocks > ros {
 						zeroBlocks--
 					}
+					if blocksDecoded+zeroBlocks > p.RSI {
+						// libaec m_zero_block: overrunning the RSI is AEC_DATA_ERROR.
+						return nil, fmt.Errorf("aec: zero-block run of %d blocks overruns RSI boundary", zeroBlocks)
+					}
 					refSamples := 0
-					if blocksDecoded == 0 {
+					if preprocess && blocksDecoded == 0 {
 						refSamples = 1
 					}
 					zeroSamples := zeroBlocks*p.BlockSize - refSamples
@@ -220,24 +227,19 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 						zeroSamples = remaining
 					}
 					if zeroSamples > 0 {
-						// Extend in place when cap permits; clear() zeros
-						// the new region so a reused (DecodeInto) buffer
-						// doesn't leak prior contents as fake zeros.
+						// cap(out) >= NumValues always; clear() so a reused
+						// DecodeInto buffer doesn't leak old data as fake zeros.
 						start := len(out)
-						end := start + zeroSamples
-						if end <= cap(out) {
-							out = out[:end]
-							clear(out[start:end])
-						} else {
-							out = append(out, make([]uint32, zeroSamples)...)
-						}
+						out = out[:start+zeroSamples]
+						clear(out[start:])
 					}
 					blocksDecoded += zeroBlocks
 					continue
 				}
-				// Second extension: libaec m_se starts at i=state->ref.
+				// Second extension: libaec m_se starts at i=state->ref
+				// (1 only for the first block of an RSI with preprocessing).
 				i := 0
-				if blocksDecoded == 0 {
+				if preprocess && blocksDecoded == 0 {
 					i = 1
 				}
 				for i < p.BlockSize && len(out) < p.NumValues {
@@ -250,7 +252,9 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 						out = append(out, d0)
 						i++
 					}
-					out = append(out, d1)
+					if len(out) < p.NumValues {
+						out = append(out, d1)
+					}
 					i++
 				}
 
@@ -273,13 +277,22 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 					refPending = false
 				}
 				// All FS values first, then all k-bit remainders (libaec m_split).
+				// The stream carries a full block (the encoder pads the last
+				// one): FS values past NumValues are consumed but not stored.
 				k := int(id) - 1
 				startIdx := len(out)
-				for i := 0; i < codedInBlock; i++ {
+				n := codedInBlock
+				if rem := p.NumValues - len(out); n > rem {
+					n = rem
+				}
+				for i := 0; i < n; i++ {
 					out = append(out, uint32(br.readFS())<<k)
 				}
+				for i := n; i < codedInBlock; i++ {
+					br.readFS()
+				}
 				if k > 0 {
-					for i := 0; i < codedInBlock; i++ {
+					for i := 0; i < n; i++ {
 						out[startIdx+i] += uint32(br.readBits(k))
 					}
 				}
@@ -289,23 +302,11 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 
 		// Postprocessor: inverse mapper + inverse predictor.
 		if preprocess {
-			rsiEnd := len(out)
-			if rsiEnd > p.NumValues {
-				rsiEnd = p.NumValues
-			}
-			if rsiEnd > rsiStart+1 {
-				inversePreprocess(out[rsiStart:rsiEnd], xmax)
-			}
+			inversePreprocess(out[rsiStart:], xmax)
 		}
 	}
 
-	if len(out) > p.NumValues {
-		out = out[:p.NumValues]
-	}
-	if err := br.err(); err != nil {
-		return out, err
-	}
-	return out, nil
+	return out, br.err()
 }
 
 // inversePreprocess reverses NN preprocessing: inverse mapper then inverse predictor.
@@ -316,25 +317,19 @@ func inversePreprocess(samples []uint32, xmax uint32) {
 	prev := samples[0]
 	for i := 1; i < len(samples); i++ {
 		d := samples[i]
-		var theta uint32
-		if prev <= xmax-prev {
-			theta = prev
-		} else {
+		theta := prev
+		if xmax-prev < theta {
 			theta = xmax - prev
 		}
 		var val uint32
 		if d <= 2*theta {
-			if d&1 == 0 {
-				val = (prev + d/2) & xmax
-			} else {
-				val = (prev - (d+1)/2) & xmax
-			}
+			// Zigzag decode: even d -> prev + d/2, odd d -> prev - (d+1)/2,
+			// branch-free via two's-complement (libaec decode.c inverse map).
+			val = (prev + ((d >> 1) ^ -(d & 1))) & xmax
+		} else if theta == prev {
+			val = d & xmax
 		} else {
-			if theta == prev {
-				val = d & xmax
-			} else {
-				val = (xmax - d) & xmax
-			}
+			val = (xmax - d) & xmax
 		}
 		samples[i] = val
 		prev = val

@@ -9,8 +9,12 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
+	"math/rand"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 )
 
@@ -232,12 +236,12 @@ func (w *bitWriter) bytes() []byte {
 // zeros, mismatching the literal RSI 2 values.
 func TestZeroBlockROSBoundary(t *testing.T) {
 	w := &bitWriter{}
+	// No preprocessing (Flags 0), so no reference samples in the stream.
 	// RSI 1, block 0: low-entropy zero-block.
 	w.write(0b000, 3)   // id=0
 	w.write(0, 1)       // sub-bit = 0 (zero-block)
-	w.write(0x00, 8)    // reference sample = 0
 	w.write(0b00001, 5) // FS = 4 → zeroBlocks = 5 → ROS escape
-	// RSI 2, block 0: no compression. id=7, ref=0xAA, then 7 × 0xBB.
+	// RSI 2, block 0: no compression. id=7, 8 samples: 0xAA, then 7 × 0xBB.
 	w.write(0b111, 3)
 	w.write(0xAA, 8)
 	for i := 0; i < 7; i++ {
@@ -688,4 +692,306 @@ func referenceToUint32(data []byte, bitsPerSample int) []uint32 {
 		}
 	}
 	return out
+}
+
+// --- Regression tests for libaec cross-check findings ---
+
+// np64: 64-sample non-preprocessed vector, generated with libaec graec
+// (-N -m -n 8 -j 16 -r 2). No FlagPreprocess means no reference samples
+// in the stream (libaec sets state->ref only when preprocessing is on).
+var np64Compressed, _ = hex.DecodeString(
+	"bfaaa4922493d9ecb5fcaaf4195492492492339df201092864ed8bf83d8d8d" +
+		"9da5c1c1d1e1e5fdfa161a2e3e3bc84bcd4f4ed0d154d6d5d958dc5c5ee100")
+
+var np64Params = Params{BitsPerSample: 8, BlockSize: 16, RSI: 2, Flags: FlagMSB, NumValues: 64}
+
+// Guards against the decoder consuming a phantom ref sample per RSI.
+func TestNonPreprocessed(t *testing.T) {
+	input, _ := hex.DecodeString(
+		"0204090e0c0f16151a1f1e2525272a303333373940424249484c535658575e" +
+			"616363676970707478797f7e85868b8f8e90979a9e9da1a2a9adabb2b1b8b8bdc2")
+	out, err := Decode(np64Compressed, np64Params)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for i, b := range input {
+		if out[i] != uint32(b) {
+			t.Fatalf("out[%d]=%d, want %d", i, out[i], b)
+		}
+	}
+}
+
+// A zero-block run that overruns the RSI boundary is a data error in libaec
+// (m_zero_block: rsi_size - used < zero_samples -> AEC_DATA_ERROR).
+func TestZeroBlockRSIOverrun(t *testing.T) {
+	w := &bitWriter{}
+	w.write(0b000, 3)     // id=0 (low-entropy)
+	w.write(0, 1)         // sub-bit = 0 (zero-block)
+	w.write(0b0000001, 7) // FS = 6 → zeroBlocks = 7 > ROS → 6 blocks, RSI is 2
+	_, err := Decode(w.bytes(), Params{
+		BitsPerSample: 8, BlockSize: 16, RSI: 2, NumValues: 96,
+	})
+	if err == nil {
+		t.Fatal("want error for zero-block run crossing RSI boundary, got nil")
+	}
+}
+
+// A stream truncated mid-FS (trailing zeros, no terminating 1 bit) must
+// report io.ErrUnexpectedEOF, not fabricate a full-size result. libaec
+// stops emitting at the truncation point (fs_ask -> M_EXIT).
+func TestTruncatedFSFabrication(t *testing.T) {
+	w := &bitWriter{}
+	w.write(0b000, 3)  // id=0
+	w.write(0, 1)      // sub-bit = 0 (zero-block)
+	w.write(0xAB, 8)   // reference sample (preprocess on)
+	w.write(0b0000, 4) // unterminated FS, then EOF
+	_, err := Decode(w.bytes(), Params{
+		BitsPerSample: 8, BlockSize: 16, RSI: 1,
+		Flags: FlagPreprocess, NumValues: 16,
+	})
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("want io.ErrUnexpectedEOF, got %v", err)
+	}
+}
+
+// NumValues not a multiple of BlockSize: the final split-sample block is
+// stored only up to NumValues and DecodeInto must stay zero-alloc.
+func TestSplitOvershoot(t *testing.T) {
+	w := &bitWriter{}
+	for block := 0; block < 2; block++ {
+		w.write(0b010, 3) // split-sample, k=1
+		for i := 0; i < 8; i++ {
+			w.write(0b01, 2) // FS value 1
+		}
+		for i := 0; i < 8; i++ {
+			w.write(0, 1) // k-bit remainder 0 → sample = 1<<1 = 2
+		}
+	}
+	p := Params{BitsPerSample: 8, BlockSize: 8, RSI: 2, NumValues: 15}
+	out, err := Decode(w.bytes(), p)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out) != 15 {
+		t.Fatalf("len=%d, want 15", len(out))
+	}
+	for i, v := range out {
+		if v != 2 {
+			t.Fatalf("out[%d]=%d, want 2", i, v)
+		}
+	}
+	buf := make([]uint32, 15)
+	out2, err := DecodeInto(buf, w.bytes(), p)
+	if err != nil {
+		t.Fatalf("DecodeInto: %v", err)
+	}
+	if &out2[0] != &buf[0] {
+		t.Fatal("DecodeInto reallocated for non-block-aligned NumValues")
+	}
+}
+
+// SE gamma >= 91 must error, never index out of range.
+func TestSEGammaHostile(t *testing.T) {
+	w := &bitWriter{}
+	w.write(0b000, 3) // id=0
+	w.write(1, 1)     // sub-bit = 1 (second extension)
+	for i := 0; i < 91; i++ {
+		w.write(0, 1)
+	}
+	w.write(1, 1) // FS = 91 → gamma out of range
+	_, err := Decode(w.bytes(), Params{
+		BitsPerSample: 8, BlockSize: 16, RSI: 1, NumValues: 16,
+	})
+	if err == nil {
+		t.Fatal("want SE gamma range error, got nil")
+	}
+}
+
+// stutterReader returns (0, nil) on alternate calls — legal per io.Reader.
+type stutterReader struct {
+	data []byte
+	tick bool
+}
+
+func (s *stutterReader) Read(p []byte) (int, error) {
+	s.tick = !s.tick
+	if s.tick {
+		return 0, nil
+	}
+	if len(s.data) == 0 {
+		return 0, io.EOF
+	}
+	p[0] = s.data[0]
+	s.data = s.data[1:]
+	return 1, nil
+}
+
+func TestStreamingStutterReader(t *testing.T) {
+	want, err := Decode(np64Compressed, np64Params)
+	if err != nil {
+		t.Fatalf("in-memory decode: %v", err)
+	}
+	got, err := NewDecoder(&stutterReader{data: np64Compressed}, np64Params).DecodeAll()
+	if err != nil {
+		t.Fatalf("streaming decode: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len=%d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got[%d]=%d, want %d", i, got[i], want[i])
+		}
+	}
+}
+
+// neverProgressReader always returns (0, nil); decode must error, not hang.
+type neverProgressReader struct{}
+
+func (neverProgressReader) Read([]byte) (int, error) { return 0, nil }
+
+func TestStreamingNoProgress(t *testing.T) {
+	_, err := NewDecoder(neverProgressReader{}, Params{
+		BitsPerSample: 8, BlockSize: 16, RSI: 1, NumValues: 16,
+	}).DecodeAll()
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("want io.ErrUnexpectedEOF, got %v", err)
+	}
+}
+
+// Every prefix of a valid stream must either error or produce exactly
+// NumValues samples — never panic, never a short "success".
+func TestAllPrefixTruncation(t *testing.T) {
+	for i := 0; i < len(np64Compressed); i++ {
+		out, err := Decode(np64Compressed[:i], np64Params)
+		if err == nil && len(out) != np64Params.NumValues {
+			t.Fatalf("prefix %d: no error but len=%d", i, len(out))
+		}
+	}
+}
+
+// --- Differential test against libaec's graec CLI ---
+
+// TestDifferentialGraec cross-checks the decoder against the libaec encoder
+// across GRIB2-shaped parameter combos the CCSDS vectors don't cover.
+// Skipped unless the graec binary is available (set AEC_GRAEC or have
+// graec/aec on PATH). Build from https://github.com/MathisRosenhauer/libaec.
+func TestDifferentialGraec(t *testing.T) {
+	graec := os.Getenv("AEC_GRAEC")
+	if graec == "" {
+		for _, name := range []string{"graec", "aec"} {
+			if p, err := exec.LookPath(name); err == nil {
+				graec = p
+				break
+			}
+		}
+	}
+	if graec == "" {
+		t.Skip("graec not available: set AEC_GRAEC or install libaec")
+	}
+
+	dir := t.TempDir()
+	rng := rand.New(rand.NewSource(42))
+	for _, bits := range []int{8, 10, 12, 16, 24, 32} {
+		for _, block := range []int{8, 32, 64} {
+			for _, rsi := range []int{32, 128} {
+				for _, pp := range []bool{true, false} {
+					name := fmt.Sprintf("b%02d_j%02d_r%d_pp%v", bits, block, rsi, pp)
+					t.Run(name, func(t *testing.T) {
+						const n = 4096
+						samples := make([]uint32, n)
+						maxVal := uint32(1)<<bits - 1
+						if bits == 32 {
+							maxVal = 0xFFFFFFFF
+						}
+						for i := range samples {
+							switch {
+							case i%512 < 128: // low-entropy stretch
+								samples[i] = uint32(i % 3)
+							case i%512 < 256: // smooth ramp (favours small deltas)
+								samples[i] = uint32(i) & maxVal
+							default: // noise
+								samples[i] = rng.Uint32() & maxVal
+							}
+						}
+						bps := bytesPerSample(bits)
+						raw := make([]byte, n*bps)
+						for i, v := range samples {
+							switch bps {
+							case 1:
+								raw[i] = byte(v)
+							case 2:
+								binary.LittleEndian.PutUint16(raw[i*2:], uint16(v))
+							case 4:
+								binary.LittleEndian.PutUint32(raw[i*4:], v)
+							}
+						}
+						src := filepath.Join(dir, name+".dat")
+						dst := filepath.Join(dir, name+".rz")
+						if err := os.WriteFile(src, raw, 0o644); err != nil {
+							t.Fatal(err)
+						}
+						args := []string{"-n", fmt.Sprint(bits), "-j", fmt.Sprint(block), "-r", fmt.Sprint(rsi)}
+						flags := 0
+						if pp {
+							flags |= FlagPreprocess
+						} else {
+							args = append(args, "-N")
+						}
+						args = append(args, src, dst)
+						if outp, err := exec.Command(graec, args...).CombinedOutput(); err != nil {
+							t.Fatalf("graec %v: %v\n%s", args, err, outp)
+						}
+						compressed, err := os.ReadFile(dst)
+						if err != nil {
+							t.Fatal(err)
+						}
+						got, err := Decode(compressed, Params{
+							BitsPerSample: bits, BlockSize: block, RSI: rsi,
+							Flags: flags, NumValues: n,
+						})
+						if err != nil {
+							t.Fatalf("decode: %v", err)
+						}
+						for i := range samples {
+							if got[i] != samples[i] {
+								t.Fatalf("sample %d: got %d, want %d", i, got[i], samples[i])
+							}
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+// --- Fuzzing ---
+
+func FuzzDecode(f *testing.F) {
+	for _, name := range []string{
+		"testdata/AllOptions_8bit.n08.rz",
+		"testdata/Lowset1_8bit.n01-basic.rz",
+	} {
+		if b, err := os.ReadFile(name); err == nil {
+			f.Add(b, uint8(8), uint8(16), uint16(16), uint16(512), uint8(FlagMSB|FlagPreprocess))
+		}
+	}
+	f.Add(np64Compressed, uint8(8), uint8(16), uint16(2), uint16(64), uint8(FlagMSB))
+
+	f.Fuzz(func(t *testing.T, data []byte, bits, block uint8, rsi, nv uint16, flags uint8) {
+		p := Params{
+			BitsPerSample: int(bits%32) + 1,
+			BlockSize:     2 * (int(block%32) + 1), // even, 2..64
+			RSI:           int(rsi%4096) + 1,
+			NumValues:     int(nv), // <= 64Ki values bounds memory
+			Flags:         int(flags) & (FlagMSB | FlagPreprocess | FlagPadRSI),
+		}
+		out, err := Decode(data, p)
+		if err == nil && len(out) != p.NumValues {
+			t.Fatalf("no error but len=%d, want %d", len(out), p.NumValues)
+		}
+		if len(out) > p.NumValues {
+			t.Fatalf("output overshoot: %d > %d", len(out), p.NumValues)
+		}
+	})
 }

@@ -39,3 +39,6 @@ jobs:
 
       - name: go test
         run: go test -race -count=1 ./...
+
+      - name: fuzz smoke
+        run: go test -run xxx -fuzz FuzzDecode -fuzztime 30s ./...

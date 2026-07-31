@@ -26,6 +26,17 @@ decoded, err := aec.Decode(compressed, aec.Params{
 })
 ```
 
+### Reuse a buffer on hot paths
+
+`DecodeInto` decodes into a caller-supplied buffer, so a per-worker scratch
+slice can be reused across many messages with zero allocations:
+
+```go
+buf = buf[:0]
+decoded, err := aec.DecodeInto(buf, compressed, params)
+buf = decoded // retain the (possibly grown) backing array for the next message
+```
+
 ### Stream from an io.Reader
 
 For large files where you don't want the entire compressed payload in memory:
@@ -50,11 +61,11 @@ AEC is the compression used by WMO GRIB2 Data Representation Template 5.42. The 
 
 ```go
 params := aec.Params{
-    BitsPerSample: bitsPerValue,          // octet 12
-    BlockSize:     blockSize,             // octet 18 (typically 16)
-    RSI:           referenceInterval,     // octet 20 (typically 128)
+    BitsPerSample: bitsPerValue,          // octet 20
+    BlockSize:     blockSize,             // octet 23 (typically 32)
+    RSI:           referenceInterval,     // octets 24-25 (typically 128)
     Flags:         codingFlags,           // octet 22 (bitwise OR of AEC flags)
-    NumValues:     numberOfDataPoints,    // section 5, octet 6-9
+    NumValues:     numberOfDataPoints,    // octets 6-9
 }
 ```
 
@@ -72,6 +83,7 @@ AEC is the underlying algorithm for the szip compression filter in HDF5. The sam
 - In-memory and streaming decode
 - Validated against the full official CCSDS 121B2 reference set (`AllOptions` n01–n32, `LowEntropyOptions` Lowset1/2/3, `ExtendedParameters` j16/r256 and j64/r4096)
 - Bit-exact match against libaec 1.1.6 on a real ECMWF AIFS open-data GRIB2 message (1,038,240 samples, 16 bps, BlockSize=32, RSI=128, FlagMSB|FlagPreprocess|Flag3Byte) — `TestRealWorldECMWFAIFS`
+- Differentially tested against the libaec encoder across 72 parameter combinations (8–32 bits, block 8/32/64, RSI 32/128, preprocessing on/off), plus continuous fuzzing in CI
 - Surfaces truncated/corrupted streams as `io.ErrUnexpectedEOF` rather than returning silent garbage
 - Production-tested on DWD ICON-D2/ICON-EU GRIB2 NWP data
 

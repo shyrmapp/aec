@@ -60,20 +60,23 @@ func (br *bitReader) fillUpTo(n int) {
 		return
 	}
 	// 8-byte fast path: when the accumulator is empty there is room for a
-	// full 64-bit load. Cheaper than two 32-bit folds.
+	// full 64-bit load. Cheaper than folding byte by byte.
 	if br.bits == 0 && br.pos+8 <= len(br.data) {
 		br.acc = binary.BigEndian.Uint64(br.data[br.pos:])
 		br.pos += 8
 		br.bits = 64
+		return
 	}
-	// Bulk-fold 4 bytes at a time when there is room (bits <= 32 means at
-	// least 32 free high-order bits in the 64-bit accumulator).
-	for br.bits <= 32 && br.pos+4 <= len(br.data) {
-		v := uint64(binary.BigEndian.Uint32(br.data[br.pos:]))
-		br.acc = (br.acc << 32) | v
-		br.pos += 4
-		br.bits += 32
+	// Branchless top-up: one unaligned 64-bit load supplies all whole bytes
+	// that fit above the live bits, leaving bits >= 56 (libaec direct_get).
+	if nb := (63 - br.bits) >> 3; nb > 0 && br.pos+8 <= len(br.data) {
+		v := binary.BigEndian.Uint64(br.data[br.pos:])
+		br.acc = br.acc<<(nb*8) | v>>(64-nb*8)
+		br.pos += nb
+		br.bits += nb * 8
+		return
 	}
+	// Tail: fewer than 8 bytes remain in the source.
 	for br.bits < n && br.pos < len(br.data) {
 		br.acc = (br.acc << 8) | uint64(br.data[br.pos])
 		br.pos++
@@ -82,6 +85,7 @@ func (br *bitReader) fillUpTo(n int) {
 }
 
 func (br *bitReader) fillStreamUpTo(n int) {
+	emptyReads := 0
 	for br.bits < n {
 		if br.rstart >= br.rend {
 			nr, err := br.r.Read(br.rbuf)
@@ -93,8 +97,14 @@ func (br *bitReader) fillStreamUpTo(n int) {
 					// observe bits < n and latch underflow themselves.
 					return
 				}
+				// Guard against readers that return (0, nil) forever
+				// (same cap as bufio's io.ErrNoProgress).
+				if emptyReads++; emptyReads >= 100 {
+					return
+				}
 				continue
 			}
+			emptyReads = 0
 		}
 		// Mirror the in-memory 8-byte fast path.
 		if br.bits == 0 && br.rend-br.rstart >= 8 {
@@ -142,6 +152,10 @@ func (br *bitReader) readFS() int {
 		if br.bits == 0 {
 			br.fillUpTo(56)
 			if br.bits == 0 {
+				// Exhausted mid-FS (no terminating 1 bit in-stream): truncation.
+				// Without the latch a zero-tail stream decodes to a fabricated
+				// full-size result with no error.
+				br.underflow = true
 				return count
 			}
 		}
