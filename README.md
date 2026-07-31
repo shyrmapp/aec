@@ -1,5 +1,9 @@
 # aec
 
+[![CI](https://github.com/shyrmapp/aec/actions/workflows/ci.yml/badge.svg)](https://github.com/shyrmapp/aec/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/shyrmapp/aec.svg)](https://pkg.go.dev/github.com/shyrmapp/aec)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Pure-Go decoder for **CCSDS 121.0-B-3** (Adaptive Entropy Coding) — the lossless compression used by GRIB2 template 5.42, HDF5 szip, and satellite telemetry.
 
 No cgo. No external C libraries. Cross-compiles to any platform Go supports.
@@ -110,4 +114,4 @@ This package was extracted from [Shyrm](https://shyrm.app), a precipitation nowc
 
 Apache 2.0 — see [LICENSE](LICENSE).
 
-Test vectors in `testdata/` are from the [CCSDS 121B2 reference data set](https://github.com/MathisRosenhauer/libaec), distributed under the BSD 2-Clause license.
+Test vectors in `testdata/` are from the [CCSDS 121B2 reference data set](https://github.com/MathisRosenhauer/libaec), distributed under the BSD 2-Clause license — see [testdata/LICENSE](testdata/LICENSE).
