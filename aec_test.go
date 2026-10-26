@@ -114,8 +114,9 @@ func TestParamValidation(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if _, err := Decode(nil, c.p); err == nil {
-				t.Errorf("expected error for %s", c.name)
+			// nil input fails with EOF anyway; only a config error proves validation ran.
+			if _, err := Decode(nil, c.p); err == nil || errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Errorf("expected a validation error for %s, got %v", c.name, err)
 			}
 		})
 	}
@@ -1033,5 +1034,22 @@ func TestTruncatedRealWorldReportsEOF(t *testing.T) {
 		if _, err := Decode(compressed[:n], p); !errors.Is(err, io.ErrUnexpectedEOF) {
 			t.Fatalf("truncated at %d: got err=%v, want io.ErrUnexpectedEOF", n, err)
 		}
+	}
+}
+
+// A reader that returns (0, nil) forever must not spin: the stream reader
+// gives up after a bounded number of empty reads and reports EOF.
+type emptyReader struct{ calls int }
+
+func (r *emptyReader) Read([]byte) (int, error) { r.calls++; return 0, nil }
+
+func TestStreamingEmptyReader(t *testing.T) {
+	r := &emptyReader{}
+	_, err := NewDecoder(r, Params{BitsPerSample: 8, BlockSize: 16, RSI: 16, NumValues: 256}).DecodeAll()
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("got err=%v, want io.ErrUnexpectedEOF", err)
+	}
+	if r.calls > 1000 {
+		t.Fatalf("%d empty reads before giving up", r.calls)
 	}
 }
