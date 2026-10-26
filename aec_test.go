@@ -995,3 +995,43 @@ func FuzzDecode(f *testing.F) {
 		}
 	})
 }
+
+// A corrupt split block without preprocessing can decode to samples wider
+// than BitsPerSample. libaec 1.1 rejects 4 of these 7 with AEC_DATA_ERROR and
+// truncates the rest to the output byte width; v0.3.3 returned them as-is
+// (e.g. 80001 for 16-bit data).
+func TestOutOfRangeNonPreprocessed(t *testing.T) {
+	for _, c := range []struct{ bps, id, fs int }{
+		{4, 1, 20}, {4, 2, 9}, {8, 1, 256}, {8, 3, 70}, {8, 1, 300}, {12, 1, 5000}, {16, 2, 40000},
+	} {
+		idLen := 3
+		if c.bps > 8 {
+			idLen = 4
+		}
+		w := &bitWriter{}
+		w.write(uint64(c.id), idLen)
+		for range c.fs {
+			w.write(0, 1)
+		}
+		w.write(0xFF, 8)          // terminator of the first FS, then seven FS = 0
+		w.write(0xFF, 8*(c.id-1)) // k-bit remainders, all ones
+		_, err := Decode(w.bytes(), Params{BitsPerSample: c.bps, BlockSize: 8, RSI: 1, NumValues: 8})
+		if err == nil {
+			t.Errorf("%+v: want out-of-range error, got nil", c)
+		}
+	}
+}
+
+// Truncation must surface as io.ErrUnexpectedEOF even when the zeros a short
+// read returns would otherwise decode into a zero-block RSI overrun.
+func TestTruncatedRealWorldReportsEOF(t *testing.T) {
+	compressed := loadTestFile(t, "testdata/ecmwf_aifs_t.aec")
+	p := Params{BitsPerSample: 16, BlockSize: 32, RSI: 128, Flags: Flag3Byte | FlagMSB | FlagPreprocess, NumValues: 1038240}
+	rng := rand.New(rand.NewSource(1))
+	for range 200 {
+		n := rng.Intn(len(compressed))
+		if _, err := Decode(compressed[:n], p); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("truncated at %d: got err=%v, want io.ErrUnexpectedEOF", n, err)
+		}
+	}
+}

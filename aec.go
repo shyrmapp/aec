@@ -168,7 +168,9 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 	}
 
 	firstRSI := true
-	for len(out) < p.NumValues {
+	// Stop at the first underflow: decoding the zeros a short read returns only
+	// burns CPU and can surface a misleading data error instead of the EOF.
+	for len(out) < p.NumValues && !br.underflow {
 		if padRSI && !firstRSI {
 			// Discard remaining bits in the current byte to align
 			// to a byte boundary (CCSDS 121.0-B-3 §4.3.2).
@@ -180,7 +182,7 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 		// is gated on state->pp).
 		refPending := preprocess
 
-		for blocksDecoded := 0; blocksDecoded < p.RSI && len(out) < p.NumValues; {
+		for blocksDecoded := 0; blocksDecoded < p.RSI && len(out) < p.NumValues && !br.underflow; {
 			id := br.readBits(idLen)
 			codedInBlock := p.BlockSize
 
@@ -303,6 +305,15 @@ func (d *Decoder) DecodeAll() ([]uint32, error) {
 		// Postprocessor: inverse mapper + inverse predictor.
 		if preprocess {
 			inversePreprocess(out[rsiStart:], xmax)
+		} else if !br.underflow && p.BitsPerSample < 32 {
+			// Without the inverse mapper's clamp a corrupt split block can
+			// yield samples wider than BitsPerSample; libaec rejects most
+			// of these (AEC_DATA_ERROR) and truncates the rest.
+			for i, v := range out[rsiStart:] {
+				if v > xmax {
+					return nil, fmt.Errorf("aec: sample %d (%d) exceeds %d-bit range", rsiStart+i, v, p.BitsPerSample)
+				}
+			}
 		}
 	}
 

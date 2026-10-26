@@ -46,7 +46,8 @@ First block of each RSI carries a reference sample **only when `FlagPreprocess`*
 - Split-sample stores at most `NumValues - len(out)` samples but still consumes the full block's FS bits (encoder pads the last block) — keeps `DecodeInto` zero-alloc for non-aligned `NumValues` (`TestSplitOvershoot`).
 - `inversePreprocess` is per-RSI, never across RSIs.
 - All buffers `uint32`; signed support deliberately absent.
-- Short reads latch underflow; `DecodeAll` returns `br.err()` **after** the loop — don't bail early, finishing keeps state consistent.
+- Short reads latch underflow; both decode loops stop on it and `DecodeAll` returns `br.err()`. Decoding the zeros a short read returns only burns CPU (18 ms for a 16M-value header) and can raise a spurious zero-block-overrun error instead of the EOF (`TestTruncatedRealWorldReportsEOF`). Verified 2026-10-26 on 3,000 truncated/bit-flipped copies of the ECMWF payload: same error/no-error and output as decoding to the end.
+- Without preprocessing, a sample wider than `BitsPerSample` is an error (`TestOutOfRangeNonPreprocessed`). libaec rejects most such streams (`AEC_DATA_ERROR`) and truncates the rest to the output byte width; garbage either way, so we reject. With preprocessing the inverse mapper clamps to `xmax`.
 
 ## Reference
 
